@@ -9,28 +9,43 @@ import android.util.AttributeSet
 import android.view.View
 
 /**
- * Màn hình đếm nhịp vẽ tay, tối ưu cho kính Rokid RV101:
- * màn 480x640 đơn sắc xanh lá -> nền đen, chữ to, ít chi tiết.
+ * Giao diện tiết kiệm pin cho màn microLED đơn sắc của Rokid RV101 (480x640):
+ *  - nền đen, mọi thứ vẽ bằng NÉT MẢNH, không có mảng tô đặc
+ *  - không nháy cả khối: khi có phách chỉ nét vòng tròn dày lên một chút
+ *  - chỉ vẽ lại khi có sự kiện (phách tới / tắt, đổi giá trị), không vẽ liên tục
+ *
+ * Bố cục 3 ô, chạm để chuyển ô (viền mảnh quanh ô đang chọn), vuốt để chỉnh:
+ *   [ BPM ]  [ Nhịp ]  [ Chạy/Dừng ]
  */
 class MetronomeView @JvmOverloads constructor(
     context: Context, attrs: AttributeSet? = null
 ) : View(context, attrs) {
 
+    companion object {
+        const val FIELD_BPM = 0
+        const val FIELD_SIG = 1
+        const val FIELD_PLAY = 2
+    }
+
     var bpm = 100
     var signature: MetronomeEngine.TimeSignature = MetronomeEngine.SIGNATURES[2]
     var running = false
-    var currentBeat = -1          // -1: chưa chạy
-    var flashUntil = 0L           // thời điểm hết sáng của vòng nhịp
-    var flashAccent = false
+    var focusedField = FIELD_PLAY
+    var currentBeat = -1
+    var beatLit = false          // true trong ~80 ms sau mỗi phách
+    var beatAccent = false
     var hint = ""
+    var showHint = false
 
-    private val white = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
-    private val green = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#00FF00") }
-    private val dim = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#777777") }
-    private val ring = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#AAAAAA"); style = Paint.Style.STROKE; strokeWidth = 6f
+    private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE; style = Paint.Style.STROKE; strokeWidth = 2f
     }
-    private val mono = Typeface.MONOSPACE
+    private val text = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE; typeface = Typeface.MONOSPACE      // chữ thường, nét mảnh
+    }
+    private val dimText = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#666666"); typeface = Typeface.MONOSPACE
+    }
 
     private fun sp(v: Float) = v * resources.displayMetrics.scaledDensity
     private fun dp(v: Float) = v * resources.displayMetrics.density
@@ -40,75 +55,69 @@ class MetronomeView @JvmOverloads constructor(
         canvas.drawColor(Color.BLACK)
         val w = width.toFloat()
         val h = height.toFloat()
-        val cx = w / 2
-        val now = System.currentTimeMillis()
-        val lit = running && now < flashUntil
+        val pad = dp(20f)
 
-        // --- Tiêu đề + loại nhịp ---
-        white.typeface = Typeface.create(mono, Typeface.BOLD)
-        white.textSize = sp(20f); white.textAlign = Paint.Align.LEFT
-        canvas.drawText("ĐẾM NHỊP", dp(24f), dp(44f), white)
-        green.typeface = Typeface.create(mono, Typeface.BOLD)
-        green.textSize = sp(26f); green.textAlign = Paint.Align.RIGHT
-        canvas.drawText("Nhịp " + signature.label, w - dp(24f), dp(46f), green)
-
-        // --- Vòng tròn nhịp đập ---
-        val r = dp(70f)
-        val cy = h * 0.40f
-        canvas.drawCircle(cx, cy, r, ring)
-        if (lit) {
-            val rr = if (flashAccent) r else r * 0.8f
-            canvas.drawCircle(cx, cy, rr, if (flashAccent) green else white)
+        // ---------- 3 ô giá trị, xếp dọc ----------
+        val rowH = dp(54f)
+        val top0 = dp(28f)
+        val labels = arrayOf("BPM", "Nhịp", "")
+        val values = arrayOf(
+            bpm.toString(),
+            signature.label,
+            if (running) "■ Dừng" else "▶ Chạy"
+        )
+        for (i in 0..2) {
+            val top = top0 + i * (rowH + dp(10f))
+            val base = top + rowH * 0.68f
+            if (labels[i].isNotEmpty()) {
+                dimText.textSize = sp(16f); dimText.textAlign = Paint.Align.LEFT
+                canvas.drawText(labels[i], pad + dp(10f), base, dimText)
+            }
+            text.textSize = sp(if (i == FIELD_BPM) 40f else 28f)
+            text.textAlign = Paint.Align.RIGHT
+            canvas.drawText(values[i], w - pad - dp(10f), base, text)
+            if (i == focusedField) {
+                // viền mảnh quanh ô đang chọn
+                stroke.strokeWidth = 2f
+                canvas.drawRect(pad, top, w - pad, top + rowH, stroke)
+            }
         }
 
-        // --- Số BPM thật to ---
-        // Khi vòng tròn sáng thì số chuyển sang màu đen để nổi trên nền sáng
-        val numPaint = Paint(Paint.ANTI_ALIAS_FLAG)
-        numPaint.color = if (lit) Color.BLACK else Color.WHITE
-        numPaint.typeface = Typeface.create(mono, Typeface.BOLD)
-        numPaint.textSize = sp(if (lit) 48f else 56f)
-        numPaint.textAlign = Paint.Align.CENTER
-        val baseline = cy + numPaint.textSize * 0.36f
-        canvas.drawText(bpm.toString(), cx, baseline, numPaint)
+        // ---------- Vòng tròn nhịp: chỉ nét, không tô ----------
+        val cy = h * 0.70f
+        val r = dp(if (beatLit && beatAccent) 44f else if (beatLit) 40f else 36f)
+        stroke.strokeWidth = if (beatLit) 5f else 2f
+        canvas.drawCircle(w / 2, cy, r, stroke)
 
-        dim.typeface = mono; dim.textSize = sp(18f); dim.textAlign = Paint.Align.CENTER
-        canvas.drawText("BPM", cx, cy + r + dp(28f), dim)
-
-        // --- Các chấm phách trong ô nhịp ---
+        // Gạch phách: gạch ngắn, phách đang chạy dài hơn; phách mạnh có 2 gạch chồng
         val n = signature.beats
-        val gap = dp(34f)
-        val startX = cx - gap * (n - 1) / 2f
-        val dotY = h * 0.70f
+        val gap = dp(26f)
+        val y = cy + dp(58f)
+        val startX = w / 2 - gap * (n - 1) / 2f
+        stroke.strokeWidth = 2f
         for (i in 0 until n) {
             val x = startX + i * gap
-            val accent = i in signature.accents
-            val isCur = running && i == currentBeat
-            val rad = if (accent) dp(10f) else dp(7f)
-            if (isCur) canvas.drawCircle(x, dotY, rad + dp(3f), if (accent) green else white)
-            else canvas.drawCircle(x, dotY, rad, ring)
+            val half = dp(if (running && i == currentBeat) 9f else 4f)
+            canvas.drawLine(x - half, y, x + half, y, stroke)
+            if (i in signature.accents) canvas.drawLine(x - half, y + dp(4f), x + half, y + dp(4f), stroke)
         }
 
-        // --- Trạng thái + gợi ý thao tác ---
-        white.typeface = Typeface.create(mono, Typeface.BOLD)
-        white.textSize = sp(22f); white.textAlign = Paint.Align.CENTER
-        canvas.drawText(if (running) "▶ ĐANG CHẠY" else "■ DỪNG", cx, h * 0.80f, white)
-
-        dim.textSize = sp(13f)
-        drawWrapped(canvas, hint, cx, h * 0.88f, w - dp(32f), dim)
-
-        if (running) postInvalidateOnAnimation()
+        // ---------- Gợi ý thao tác (chỉ hiện vài giây) ----------
+        if (showHint && hint.isNotEmpty()) {
+            dimText.textSize = sp(12f); dimText.textAlign = Paint.Align.CENTER
+            drawWrapped(canvas, hint, w / 2, h - dp(26f), w - 2 * pad, dimText)
+        }
     }
 
-    private fun drawWrapped(c: Canvas, text: String, cx: Float, y: Float, maxW: Float, p: Paint) {
-        val words = text.split(" ")
+    private fun drawWrapped(c: Canvas, s: String, cx: Float, yBottom: Float, maxW: Float, p: Paint) {
+        val lines = ArrayList<String>()
         var line = ""
-        var yy = y
-        for (wd in words) {
-            val trial = if (line.isEmpty()) wd else "$line $wd"
-            if (p.measureText(trial) > maxW && line.isNotEmpty()) {
-                c.drawText(line, cx, yy, p); yy += p.textSize * 1.3f; line = wd
-            } else line = trial
+        for (wd in s.split(" ")) {
+            val t = if (line.isEmpty()) wd else "$line $wd"
+            if (p.measureText(t) > maxW && line.isNotEmpty()) { lines.add(line); line = wd } else line = t
         }
-        if (line.isNotEmpty()) c.drawText(line, cx, yy, p)
+        if (line.isNotEmpty()) lines.add(line)
+        var y = yBottom - (lines.size - 1) * p.textSize * 1.3f
+        for (l in lines) { c.drawText(l, cx, y, p); y += p.textSize * 1.3f }
     }
 }
