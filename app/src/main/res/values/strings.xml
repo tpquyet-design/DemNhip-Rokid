@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Đếm Nhịp</string>
+    <string name="hint_stopped">Chạm: chạy · Lên/Xuống: ±5 · Trái/Phải: ±1 · Chạm 2 lần: đổi nhịp</string>
+    <string name="hint_running">Chạm: dừng · Lên/Xuống: ±5 · Trái/Phải: ±1</string>
+    <string name="bpm_unit">BPM</string>
+</resources>
