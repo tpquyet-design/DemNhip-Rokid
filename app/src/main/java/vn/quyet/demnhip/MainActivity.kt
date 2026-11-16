@@ -12,25 +12,27 @@ import android.view.WindowManager
 import kotlin.math.abs
 
 /**
- * Điều khiển bằng bàn cảm ứng trên gọng kính Rokid (gửi về dạng phím D-pad):
- *   - Chạm 1 lần   : chạy / dừng
- *   - Chạm 2 lần   : đổi loại nhịp (2/4 → 3/4 → 4/4 → 6/8)
- *   - Vuốt lên/xuống: BPM ±5
- *   - Vuốt trái/phải: BPM ±1
- *   - Giữ lâu (Back): thoát
- * Đồng thời nhận vuốt/chạm màn hình thật khi chiếu kính qua scrcpy để thử.
+ * Điều khiển kiểu "menu máy ảnh" (phương án B):
+ *   - Chạm 1 lần   : chuyển ô đang chọn  BPM -> Nhịp -> Chạy/Dừng -> BPM ...
+ *   - Vuốt tới/lui : chỉnh giá trị ô đang chọn
+ *        BPM   : +1 / -1 (vuốt liên tiếp nhanh từ cú thứ 3 thì +5 / -5)
+ *        Nhịp  : 2/4 <-> 3/4 <-> 4/4 <-> 6/8
+ *        Chạy  : vuốt bất kỳ = chạy / dừng
+ *   - Chạm 2 lần   : để nguyên cho hệ thống (thoát app)
  */
 class MainActivity : Activity(), MetronomeEngine.Listener {
 
     private lateinit var view: MetronomeView
     private lateinit var engine: MetronomeEngine
     private val ui = Handler(Looper.getMainLooper())
-
     private val prefs by lazy { getSharedPreferences("demnhip", Context.MODE_PRIVATE) }
 
-    // Phân biệt chạm 1 lần / 2 lần từ phím Enter/DPAD_CENTER
-    private val doubleTapMs = 350L
-    private var pendingSingleTap: Runnable? = null
+    private var lastSwipeAt = 0L
+    private var lastSwipeDir = 0
+    private var fastSwipes = 0
+
+    private val beatOff = Runnable { view.beatLit = false; view.invalidate() }
+    private val hideHint = Runnable { view.showHint = false; view.invalidate() }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -46,92 +48,101 @@ class MainActivity : Activity(), MetronomeEngine.Listener {
         setContentView(view)
         view.requestFocus()
 
+        // Phòng khi kính đưa thao tác về dạng chạm màn hình (hoặc khi thử qua scrcpy)
         val gestures = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
             override fun onDown(e: MotionEvent) = true
-            override fun onSingleTapConfirmed(e: MotionEvent): Boolean { toggle(); return true }
-            override fun onDoubleTap(e: MotionEvent): Boolean { cycleSignature(); return true }
+            override fun onSingleTapUp(e: MotionEvent): Boolean { onTap(); return true }
             override fun onFling(e1: MotionEvent?, e2: MotionEvent, vx: Float, vy: Float): Boolean {
                 if (e1 == null) return false
                 val dx = e2.x - e1.x; val dy = e2.y - e1.y
-                if (abs(dx) > abs(dy)) changeBpm(if (dx > 0) 1 else -1)
-                else changeBpm(if (dy < 0) 5 else -5)
+                val forward = if (abs(dx) > abs(dy)) dx > 0 else dy < 0
+                onSwipe(if (forward) 1 else -1)
                 return true
             }
         })
         view.setOnTouchListener { _, ev -> gestures.onTouchEvent(ev); true }
 
-        refresh()
+        refresh(showHint = true)
     }
 
-    // ---------- Phím từ bàn cảm ứng trên gọng kính ----------
+    // ---------- Phím hệ thống sinh ra từ bàn cảm ứng ----------
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
         if (event.repeatCount > 0) return true
         when (keyCode) {
-            KeyEvent.KEYCODE_DPAD_UP -> changeBpm(5)
-            KeyEvent.KEYCODE_DPAD_DOWN -> changeBpm(-5)
-            KeyEvent.KEYCODE_DPAD_RIGHT -> changeBpm(1)
-            KeyEvent.KEYCODE_DPAD_LEFT -> changeBpm(-1)
+            // Vuốt tới / lui: tuỳ firmware là trái/phải hay lên/xuống, nhận cả hai
+            KeyEvent.KEYCODE_DPAD_RIGHT, KeyEvent.KEYCODE_DPAD_UP,
+            KeyEvent.KEYCODE_VOLUME_UP, KeyEvent.KEYCODE_MEDIA_NEXT -> onSwipe(1)
+            KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_DOWN,
+            KeyEvent.KEYCODE_VOLUME_DOWN, KeyEvent.KEYCODE_MEDIA_PREVIOUS -> onSwipe(-1)
             KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER,
-            KeyEvent.KEYCODE_NUMPAD_ENTER, KeyEvent.KEYCODE_SPACE -> onTapKey()
-            KeyEvent.KEYCODE_VOLUME_UP -> changeBpm(1)      // phòng khi kính gửi phím âm lượng
-            KeyEvent.KEYCODE_VOLUME_DOWN -> changeBpm(-1)
-            else -> return super.onKeyDown(keyCode, event)
+            KeyEvent.KEYCODE_NUMPAD_ENTER, KeyEvent.KEYCODE_SPACE,
+            KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, KeyEvent.KEYCODE_HEADSETHOOK -> onTap()
+            else -> return super.onKeyDown(keyCode, event)   // Back: để hệ thống thoát app
         }
         return true
     }
 
-    private fun onTapKey() {
-        val pending = pendingSingleTap
-        if (pending != null) {           // chạm lần 2 trong khoảng cho phép -> double tap
-            ui.removeCallbacks(pending)
-            pendingSingleTap = null
-            cycleSignature()
-        } else {
-            val r = Runnable { pendingSingleTap = null; toggle() }
-            pendingSingleTap = r
-            ui.postDelayed(r, doubleTapMs)
-        }
-    }
-
     // ---------- Hành động ----------
-    private fun toggle() {
-        if (engine.isRunning) engine.stop() else engine.start()
-        view.currentBeat = -1
+    private fun onTap() {
+        view.focusedField = (view.focusedField + 1) % 3
+        refresh(showHint = true)
+    }
+
+    private fun onSwipe(dir: Int) {
+        when (view.focusedField) {
+            MetronomeView.FIELD_BPM -> {
+                val now = System.currentTimeMillis()
+                fastSwipes = if (dir == lastSwipeDir && now - lastSwipeAt < 350) fastSwipes + 1 else 0
+                lastSwipeAt = now; lastSwipeDir = dir
+                engine.bpm = engine.bpm + dir * (if (fastSwipes >= 2) 5 else 1)
+            }
+            MetronomeView.FIELD_SIG -> {
+                engine.signatureIndex = engine.signatureIndex + dir
+                view.currentBeat = -1
+            }
+            else -> {
+                if (engine.isRunning) engine.stop() else engine.start()
+                view.currentBeat = -1
+            }
+        }
         refresh()
     }
 
-    private fun changeBpm(delta: Int) {
-        engine.bpm = engine.bpm + delta
-        refresh()
-    }
-
-    private fun cycleSignature() {
-        engine.signatureIndex = engine.signatureIndex + 1
-        view.currentBeat = -1
-        refresh()
-    }
-
-    private fun refresh() {
+    private fun refresh(showHint: Boolean = false) {
         view.bpm = engine.bpm
         view.signature = engine.signature
         view.running = engine.isRunning
-        view.hint = getString(if (engine.isRunning) R.string.hint_running else R.string.hint_stopped)
+        view.hint = getString(
+            when (view.focusedField) {
+                MetronomeView.FIELD_BPM -> R.string.hint_bpm
+                MetronomeView.FIELD_SIG -> R.string.hint_sig
+                else -> R.string.hint_play
+            }
+        )
+        if (showHint) {
+            view.showHint = true
+            ui.removeCallbacks(hideHint)
+            ui.postDelayed(hideHint, 5000)
+        }
         view.invalidate()
     }
 
-    // ---------- Từ luồng âm thanh ----------
+    // ---------- Từ luồng âm thanh: vẽ 2 lần mỗi phách (sáng rồi tắt) ----------
     override fun onBeat(beat: Int, accent: Boolean) {
         ui.post {
             view.currentBeat = beat
-            view.flashAccent = accent
-            view.flashUntil = System.currentTimeMillis() + 90
+            view.beatAccent = accent
+            view.beatLit = true
             view.invalidate()
+            ui.removeCallbacks(beatOff)
+            ui.postDelayed(beatOff, 80)
         }
     }
 
     override fun onPause() {
         super.onPause()
         engine.stop()
+        ui.removeCallbacks(beatOff)
         prefs.edit().putInt("bpm", engine.bpm).putInt("sig", engine.signatureIndex).apply()
         refresh()
     }
